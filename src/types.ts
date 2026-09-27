@@ -50,12 +50,33 @@ export interface SignItem {
   updatedAt: string;
 }
 
+export interface EmergencyBatchEntry {
+  signId: string;
+  code: string;
+  sourceText: string;
+  originalStatus: ReviewStatus;
+  originalTargetText: string;
+  snapshotSavedAt: string | null;
+  finalStatus: ReviewStatus | null;
+  finalTargetText: string | null;
+}
+
+export interface EmergencyBatch {
+  id: string;
+  incidentNo: string;
+  reason: string;
+  createdAt: string;
+  closedAt: string | null;
+  entries: EmergencyBatchEntry[];
+}
+
 export interface SignProject {
   id: string;
   title: string;
   location: string;
   activeSignId: string;
   signs: SignItem[];
+  batches: EmergencyBatch[];
   updatedAt: string;
 }
 
