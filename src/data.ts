@@ -1,4 +1,4 @@
-import type { ReviewStatus, SignItem, SignProject, TermBinding } from "./types";
+import type { EmergencyBatch, ReviewStatus, SignItem, SignProject, TermBinding } from "./types";
 
 export const uid = (prefix: string) =>
   `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -88,6 +88,21 @@ export const createSeedProject = (): SignProject => {
     location: "滨海交通枢纽一期",
     activeSignId: signs[0].id,
     signs,
+    emergencyBatches: [],
+    activeBatchId: null,
     updatedAt: new Date().toISOString(),
   };
 };
+
+export const normalizeProject = (project: SignProject): SignProject => {
+  project.emergencyBatches ??= [];
+  project.activeBatchId ??= null;
+  for (const sign of project.signs) sign.versions ??= [];
+  return project;
+};
+
+export const findActiveBatch = (project: SignProject): EmergencyBatch | undefined =>
+  (project.emergencyBatches ?? []).find((batch) => batch.id === project.activeBatchId && !batch.closedAt);
+
+export const findActiveBatchEntry = (project: SignProject, signId: string) =>
+  findActiveBatch(project)?.entries.find((entry) => entry.signId === signId);

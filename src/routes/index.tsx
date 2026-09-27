@@ -1,7 +1,7 @@
 import { $, component$, useSignal, useVisibleTask$, type QRL } from "@builder.io/qwik";
 import { type DocumentHead } from "@builder.io/qwik-city";
-import { createSeedProject, STATUS_LABELS, uid } from "../data";
-import type { ReviewStatus, SignItem, SignProject } from "../types";
+import { createSeedProject, findActiveBatch, findActiveBatchEntry, normalizeProject, STATUS_LABELS, uid } from "../data";
+import type { EmergencyBatch, ReviewStatus, SignItem, SignProject } from "../types";
 import { analyzeSign, cloneTerms, diffText } from "../utils";
 
 const STORAGE_KEY = "sologsb-1008-project-v1";
@@ -38,7 +38,21 @@ export default component$(() => {
   const toast = useSignal("");
   const previewId = useSignal("");
   const readOnly = useSignal(false);
+  const batchModalOpen = useSignal(false);
+  const batchEventNo = useSignal("");
+  const batchReason = useSignal("");
+  const batchSelection = useSignal<string[]>([]);
+  const reportBatchId = useSignal("");
   const active = () => project.value.signs.find((sign) => sign.id === (previewId.value || project.value.activeSignId)) ?? project.value.signs[0];
+  const activeBatch = () => findActiveBatch(project.value);
+  const activeBatchEntry = () => findActiveBatchEntry(project.value, project.value.activeSignId);
+  const batchProgress = () => {
+    const batch = activeBatch();
+    if (!batch) return null;
+    const confirmed = batch.entries.filter((entry) => project.value.signs.find((sign) => sign.id === entry.signId)?.status === "confirmed").length;
+    return { batch, confirmed, total: batch.entries.length, allConfirmed: batch.entries.length > 0 && confirmed === batch.entries.length };
+  };
+  const reportBatch = () => project.value.emergencyBatches.find((batch) => batch.id === reportBatchId.value);
 
   const commit = $((label: string, update: (draft: SignProject) => void) => {
     past.value = [...past.value.slice(-49), structuredClone(project.value)];
@@ -84,15 +98,124 @@ export default component$(() => {
   });
 
   const setStatus = $((status: ReviewStatus) => {
+    const sign = project.value.signs.find((item) => item.id === project.value.activeSignId);
+    if (!sign) return;
+    const inBatch = Boolean(findActiveBatchEntry(project.value, sign.id));
+    const needsRevisionStep = sign.status === "changes" || sign.status === "draft";
+    if (inBatch && needsRevisionStep && (status === "pending" || status === "confirmed")) {
+      toast.value = "批次内标识请先「保存修订快照并提交待确认」";
+      return;
+    }
     commit("更新审校状态", (draft) => {
-      const sign = draft.signs.find((item) => item.id === draft.activeSignId);
-      if (!sign) return;
-      if (sign.emergencyRevision && status === "confirmed") {
-        sign.status = "pending";
+      const current = draft.signs.find((item) => item.id === draft.activeSignId);
+      if (!current) return;
+      if (!inBatch && current.emergencyRevision && status === "confirmed") {
+        current.status = "pending";
       } else {
-        sign.status = status;
+        current.status = status;
       }
     });
+  });
+
+  const toggleBatchSelection = $((signId: string) => {
+    batchSelection.value = batchSelection.value.includes(signId)
+      ? batchSelection.value.filter((id) => id !== signId)
+      : [...batchSelection.value, signId];
+  });
+
+  const startBatch = $(() => {
+    const eventNo = batchEventNo.value.trim();
+    const reason = batchReason.value.trim();
+    if (!eventNo || !reason || !batchSelection.value.length) return;
+    const batchId = uid("batch");
+    commit("开始紧急修订批次", (draft) => {
+      const batch: EmergencyBatch = {
+        id: batchId,
+        eventNo,
+        reason,
+        createdAt: new Date().toISOString(),
+        entries: [],
+      };
+      for (const signId of batchSelection.value) {
+        const sign = draft.signs.find((item) => item.id === signId);
+        if (!sign) continue;
+        batch.entries.push({
+          signId,
+          code: sign.code,
+          originalStatus: sign.status,
+          entryTargetText: sign.targetText,
+          versionIds: [],
+        });
+        sign.status = "changes";
+      }
+      draft.emergencyBatches.unshift(batch);
+      draft.activeBatchId = batchId;
+      if (batch.entries.length && !batch.entries.some((entry) => entry.signId === draft.activeSignId)) {
+        draft.activeSignId = batch.entries[0].signId;
+      }
+    });
+    batchModalOpen.value = false;
+    batchSelection.value = [];
+    batchEventNo.value = "";
+    batchReason.value = "";
+    selectedVersionId.value = "";
+    toast.value = "批次已开始，所选标识已转为需修改，原状态已留档";
+  });
+
+  const completeBatchRevision = $(() => {
+    const signId = project.value.activeSignId;
+    const batch = findActiveBatch(project.value);
+    if (!batch || !findActiveBatchEntry(project.value, signId)) return;
+    const versionId = uid("version");
+    commit("保存批次修订快照", (draft) => {
+      const current = draft.signs.find((item) => item.id === signId);
+      const entry = findActiveBatchEntry(draft, signId);
+      if (!current || !entry) return;
+      current.versions.unshift({
+        id: versionId,
+        label: `批次 ${batch.eventNo} · 版本 ${current.versions.length + 1}`,
+        createdAt: new Date().toISOString(),
+        sourceText: current.sourceText,
+        targetText: current.targetText,
+        status: current.status,
+        terms: cloneTerms(current.terms),
+      });
+      current.versions = current.versions.slice(0, 12);
+      current.status = "pending";
+      entry.versionIds.push(versionId);
+    });
+    selectedVersionId.value = versionId;
+    toast.value = "已保存批次快照并回到待确认";
+  });
+
+  const endBatch = $(() => {
+    const progress = batchProgress();
+    if (!progress) return;
+    if (!progress.allConfirmed) {
+      toast.value = "全部标识重新确认后才能结束批次";
+      return;
+    }
+    const batchId = progress.batch.id;
+    commit("结束紧急修订批次", (draft) => {
+      const batch = draft.emergencyBatches.find((item) => item.id === batchId);
+      if (!batch) return;
+      batch.closedAt = new Date().toISOString();
+      for (const entry of batch.entries) {
+        const sign = draft.signs.find((item) => item.id === entry.signId);
+        entry.finalStatus = sign?.status ?? entry.originalStatus;
+        entry.finalTargetText = sign?.targetText ?? entry.entryTargetText;
+      }
+      draft.activeBatchId = null;
+    });
+    batchModalOpen.value = false;
+    reportBatchId.value = batchId;
+    toast.value = "批次已结束，各标识保留当前状态，不恢复原状态";
+  });
+
+  const locateBatchSign = $((signId: string) => {
+    commit("切换标识", (draft) => { draft.activeSignId = signId; });
+    selectedVersionId.value = "";
+    batchModalOpen.value = false;
   });
 
   const toggleEmergency = $(() => {
@@ -121,6 +244,7 @@ export default component$(() => {
         terms: cloneTerms(current.terms),
       });
       current.versions = current.versions.slice(0, 12);
+      findActiveBatchEntry(draft, draft.activeSignId)?.versionIds.push(versionId);
     });
     selectedVersionId.value = versionId;
     toast.value = "版本快照已保存";
@@ -130,9 +254,9 @@ export default component$(() => {
     const source = termSource.value.trim();
     const target = termTarget.value.trim();
     if (!source || !target) return;
-    updateActive("绑定术语", (sign) => {
+    updateActive("绑定术语", (sign, draft) => {
       sign.terms.push({ id: uid("term"), source, target, required: true, confirmed: false });
-      sign.status = "pending";
+      sign.status = findActiveBatchEntry(draft, sign.id) ? "changes" : "pending";
     });
     termSource.value = "";
     termTarget.value = "";
@@ -186,7 +310,7 @@ export default component$(() => {
     if (!hydrated.value) {
       try {
         const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "") as { schema: number; project: SignProject };
-        if (stored.schema === 1 && stored.project?.signs?.length) project.value = stored.project;
+        if (stored.schema === 1 && stored.project?.signs?.length) project.value = normalizeProject(stored.project);
         const requestedPreview = new URLSearchParams(window.location.search).get("preview") ?? "";
         previewId.value = requestedPreview;
         readOnly.value = Boolean(requestedPreview);
@@ -295,16 +419,35 @@ export default component$(() => {
           <button class="btn btn-ghost btn-sm" disabled={!past.value.length} onClick$={undo}>撤销</button>
           <button class="btn btn-ghost btn-sm" disabled={!future.value.length} onClick$={redo}>重做</button>
           <button class="btn btn-sm border-white/20 bg-white/10 text-white hover:bg-white/20" onClick$={sharePreview}>复制只读链接</button>
+          <button class={`btn btn-sm ${batchProgress() ? "btn-error" : "btn-outline border-white/30 text-white"}`} onClick$={() => batchModalOpen.value = true}>
+            {batchProgress() ? `批次 ${batchProgress()!.confirmed}/${batchProgress()!.total}` : "紧急修订批次"}
+          </button>
           <button class={`btn btn-sm ${active().emergencyRevision ? "btn-error" : "btn-warning"}`} onClick$={toggleEmergency}>
             {active().emergencyRevision ? "退出紧急修订" : "紧急修订"}
           </button>
         </div>
       </header>
 
-      {active().emergencyRevision && (
-        <div class="alert alert-error sticky top-16 z-30 rounded-none border-x-0 py-2 text-white">
-          <span class="text-lg">!</span>
-          <span><strong>紧急修订模式</strong>：确认操作已锁定，修改后必须重新审校并保存版本。</span>
+      {(batchProgress() || active().emergencyRevision) && (
+        <div class="sticky top-16 z-30">
+          {batchProgress() && (
+            <div class="alert alert-error rounded-none border-x-0 py-2 text-white">
+              <span class="text-lg">!</span>
+              <span class="min-w-0 flex-1 truncate">
+                <strong>紧急修订批次进行中</strong> · 事件 {batchProgress()!.batch.eventNo}：{batchProgress()!.batch.reason}
+              </span>
+              <progress class="progress progress-warning hidden w-36 md:block" value={batchProgress()!.confirmed} max={batchProgress()!.total}></progress>
+              <span class="text-xs font-bold">{batchProgress()!.confirmed}/{batchProgress()!.total} 已确认</span>
+              <button class="btn btn-ghost btn-xs text-white" onClick$={() => batchModalOpen.value = true}>查看批次</button>
+              <button class="btn btn-xs border-white/40 text-white" disabled={!batchProgress()!.allConfirmed} title={batchProgress()!.allConfirmed ? "" : "全部标识重新确认后才能结束批次"} onClick$={endBatch}>结束批次</button>
+            </div>
+          )}
+          {active().emergencyRevision && (
+            <div class="alert alert-error rounded-none border-x-0 border-t-0 py-2 text-white">
+              <span class="text-lg">!</span>
+              <span><strong>紧急修订模式</strong>：确认操作已锁定，修改后必须重新审校并保存版本。</span>
+            </div>
+          )}
         </div>
       )}
 
@@ -329,7 +472,10 @@ export default component$(() => {
                 >
                   <div class="flex items-center justify-between">
                     <span class="font-mono text-xs font-bold text-slate-500">{sign.code}</span>
-                    <span class={`badge badge-sm ${statusClass(sign.status)}`}>{STATUS_LABELS[sign.status]}</span>
+                    <span class="flex items-center gap-1">
+                      {findActiveBatchEntry(project.value, sign.id) && <span class="badge badge-sm badge-error badge-outline">批次</span>}
+                      <span class={`badge badge-sm ${statusClass(sign.status)}`}>{STATUS_LABELS[sign.status]}</span>
+                    </span>
                   </div>
                   <div class="mt-2 line-clamp-2 text-sm font-semibold text-slate-700">{sign.sourceText}</div>
                   <div class="mt-2 flex items-center justify-between text-[11px] text-slate-500">
@@ -353,14 +499,55 @@ export default component$(() => {
                 <h1 class="mt-1 text-xl font-bold">中文原文与译文校对</h1>
               </div>
               <div class="join">
-                {(["draft", "pending", "changes", "confirmed"] as ReviewStatus[]).map((status) => (
-                  <button key={status} class={`btn join-item btn-sm ${active().status === status ? "btn-primary" : "btn-outline"}`} onClick$={() => setStatus(status)}>{STATUS_LABELS[status]}</button>
-                ))}
+                {(["draft", "pending", "changes", "confirmed"] as ReviewStatus[]).map((status) => {
+                  const blocked = Boolean(activeBatchEntry())
+                    && (active().status === "changes" || active().status === "draft")
+                    && (status === "pending" || status === "confirmed");
+                  return (
+                    <button
+                      key={status}
+                      class={`btn join-item btn-sm ${active().status === status ? "btn-primary" : "btn-outline"}`}
+                      disabled={blocked}
+                      title={blocked ? "批次内标识请先「保存修订快照并提交待确认」" : ""}
+                      onClick$={() => setStatus(status)}
+                    >
+                      {STATUS_LABELS[status]}
+                    </button>
+                  );
+                })}
               </div>
             </div>
           </div>
 
           <div class="space-y-5 p-6">
+            {activeBatchEntry() && activeBatch() && (
+              <section class="card border-2 border-error/50 bg-red-50 shadow-sm">
+                <div class="card-body gap-3 p-5">
+                  <div class="flex items-start justify-between gap-4">
+                    <div class="min-w-0">
+                      <div class="text-xs font-bold uppercase tracking-[0.16em] text-error">Emergency Batch</div>
+                      <h2 class="font-bold">批次修订 · 事件 {activeBatch()!.eventNo}</h2>
+                      <p class="mt-1 text-xs leading-5 text-slate-600">{activeBatch()!.reason}</p>
+                    </div>
+                    <div class="shrink-0 text-right text-xs">
+                      <div>原状态 <span class={`badge badge-sm ${statusClass(activeBatchEntry()!.originalStatus)}`}>{STATUS_LABELS[activeBatchEntry()!.originalStatus]}</span></div>
+                      <div class="mt-1 text-slate-500">批次快照 {activeBatchEntry()!.versionIds.length} 个</div>
+                    </div>
+                  </div>
+                  {active().status === "confirmed" ? (
+                    <div class="alert alert-success py-2 text-sm">本条已重新确认。全部标识确认后可在批次面板结束批次。</div>
+                  ) : active().status === "pending" ? (
+                    <div class="alert alert-warning py-2 text-sm">修订快照已保存，等待重新确认：核对后在状态栏点击「已确认」。</div>
+                  ) : (
+                    <div class="flex flex-wrap items-center justify-between gap-3">
+                      <p class="text-xs leading-5 text-slate-600">完成译文修改后点击右侧按钮，系统会保存版本快照并把本条转回「待确认」。</p>
+                      <button class="btn btn-error btn-sm" onClick$={completeBatchRevision}>保存修订快照并提交待确认</button>
+                    </div>
+                  )}
+                </div>
+              </section>
+            )}
+
             <section class="card border border-slate-200 bg-white shadow-sm">
               <div class="card-body gap-4 p-5">
                 <div class="flex items-center justify-between">
@@ -380,7 +567,7 @@ export default component$(() => {
                 <div class="grid grid-cols-2 gap-4">
                   <label class="form-control">
                     <span class="label-text mb-1 text-xs font-bold text-slate-500">目标语言</span>
-                    <select class="select select-bordered" value={active().targetLanguage} onChange$={(_, element) => updateActive("修改目标语言", (sign) => { sign.targetLanguage = element.value; sign.status = "pending"; })}>
+                    <select class="select select-bordered" value={active().targetLanguage} onChange$={(_, element) => updateActive("修改目标语言", (sign, draft) => { sign.targetLanguage = element.value; sign.status = findActiveBatchEntry(draft, sign.id) ? "changes" : "pending"; })}>
                       {["English", "日本語", "Français", "Deutsch", "한국어", "Español"].map((language) => <option key={language}>{language}</option>)}
                     </select>
                   </label>
@@ -401,7 +588,7 @@ export default component$(() => {
                 <textarea
                   class="textarea textarea-bordered min-h-36 w-full text-lg leading-8"
                   value={active().targetText}
-                  onInput$={(_, element) => updateActive("修改译文", (sign) => { sign.targetText = element.value; sign.status = sign.emergencyRevision ? "changes" : "pending"; })}
+                  onInput$={(_, element) => updateActive("修改译文", (sign, draft) => { sign.targetText = element.value; sign.status = sign.emergencyRevision || findActiveBatchEntry(draft, sign.id) ? "changes" : "pending"; })}
                 />
                 <div class="flex flex-wrap gap-2">
                   {active().terms.map((term) => {
@@ -551,6 +738,157 @@ export default component$(() => {
           </section>
         </aside>
       </div>
+
+      {batchModalOpen.value && (
+        <div class="modal modal-open">
+          <div class="modal-box max-w-2xl">
+            {activeBatch() ? (
+              <>
+                <h3 class="text-lg font-bold">批次进行中 · 事件 {activeBatch()!.eventNo}</h3>
+                <p class="mt-1 text-sm text-slate-600">{activeBatch()!.reason}</p>
+                <p class="mt-1 text-xs text-slate-400">开始于 {new Date(activeBatch()!.createdAt).toLocaleString()}</p>
+                <div class="mt-3 flex items-center gap-3">
+                  <progress class="progress progress-error flex-1" value={batchProgress()!.confirmed} max={batchProgress()!.total}></progress>
+                  <span class="text-xs font-bold">{batchProgress()!.confirmed}/{batchProgress()!.total} 已确认</span>
+                </div>
+                <div class="mt-4 max-h-72 space-y-2 overflow-y-auto">
+                  {activeBatch()!.entries.map((entry) => {
+                    const sign = project.value.signs.find((item) => item.id === entry.signId);
+                    if (!sign) return null;
+                    return (
+                      <div key={entry.signId} class="flex items-center gap-3 rounded-xl border border-slate-200 p-3">
+                        <div class="min-w-0 flex-1">
+                          <div class="flex flex-wrap items-center gap-2">
+                            <span class="font-mono text-xs font-bold">{entry.code}</span>
+                            <span class={`badge badge-sm ${statusClass(entry.originalStatus)}`}>{STATUS_LABELS[entry.originalStatus]}</span>
+                            <span class="text-slate-400">→</span>
+                            <span class={`badge badge-sm ${statusClass(sign.status)}`}>{STATUS_LABELS[sign.status]}</span>
+                          </div>
+                          <div class="mt-1 truncate text-xs text-slate-500">{sign.sourceText}</div>
+                          <div class="mt-1 text-[11px] text-slate-400">批次快照 {entry.versionIds.length} 个</div>
+                        </div>
+                        <button class="btn btn-xs btn-outline" onClick$={() => locateBatchSign(entry.signId)}>定位</button>
+                      </div>
+                    );
+                  })}
+                </div>
+                <div class="modal-action items-center">
+                  {!batchProgress()!.allConfirmed && <span class="mr-auto text-xs text-slate-500">全部标识重新确认后才能结束批次。</span>}
+                  <button class="btn btn-ghost btn-sm" onClick$={() => batchModalOpen.value = false}>关闭</button>
+                  <button class="btn btn-error btn-sm" disabled={!batchProgress()!.allConfirmed} onClick$={endBatch}>结束批次</button>
+                </div>
+              </>
+            ) : (
+              <>
+                <h3 class="text-lg font-bold">发起紧急修订批次</h3>
+                <p class="mt-1 text-xs leading-5 text-slate-500">勾选需要修订的标识并填写事件信息。开始后所选标识全部转为「需修改」，原状态会留档，全部重新确认前批次不能结束。</p>
+                <div class="mt-4 grid gap-3">
+                  <label class="form-control">
+                    <span class="label-text mb-1 text-xs font-bold text-slate-500">事件编号</span>
+                    <input class="input input-sm input-bordered" placeholder="如 EVENT-2026-0927-01" value={batchEventNo.value} onInput$={(_, element) => batchEventNo.value = element.value} />
+                  </label>
+                  <label class="form-control">
+                    <span class="label-text mb-1 text-xs font-bold text-slate-500">修订原因</span>
+                    <textarea class="textarea textarea-bordered min-h-16" placeholder="如：东侧出口临时封闭，相关指引标识需调整" value={batchReason.value} onInput$={(_, element) => batchReason.value = element.value} />
+                  </label>
+                </div>
+                <div class="mt-3 flex items-center justify-between">
+                  <span class="text-xs font-bold text-slate-500">选择标识（已选 {batchSelection.value.length} / {project.value.signs.length}）</span>
+                  <span class="flex gap-2">
+                    <button class="btn btn-xs btn-ghost" onClick$={() => batchSelection.value = project.value.signs.map((sign) => sign.id)}>全选</button>
+                    <button class="btn btn-xs btn-ghost" onClick$={() => batchSelection.value = []}>清空</button>
+                  </span>
+                </div>
+                <div class="mt-2 max-h-56 space-y-1 overflow-y-auto">
+                  {project.value.signs.map((sign) => (
+                    <label key={sign.id} class="flex cursor-pointer items-center gap-3 rounded-lg border border-slate-200 p-2 hover:border-slate-300">
+                      <input type="checkbox" class="checkbox checkbox-sm" checked={batchSelection.value.includes(sign.id)} onChange$={() => toggleBatchSelection(sign.id)} />
+                      <span class="font-mono text-xs font-bold text-slate-500">{sign.code}</span>
+                      <span class={`badge badge-sm ${statusClass(sign.status)}`}>{STATUS_LABELS[sign.status]}</span>
+                      <span class="min-w-0 flex-1 truncate text-xs text-slate-600">{sign.sourceText}</span>
+                    </label>
+                  ))}
+                </div>
+                <div class="modal-action">
+                  <button class="btn btn-ghost btn-sm" onClick$={() => batchModalOpen.value = false}>取消</button>
+                  <button
+                    class="btn btn-error btn-sm"
+                    disabled={!batchEventNo.value.trim() || !batchReason.value.trim() || !batchSelection.value.length}
+                    onClick$={startBatch}
+                  >
+                    开始批次（{batchSelection.value.length} 条）
+                  </button>
+                </div>
+              </>
+            )}
+            {project.value.emergencyBatches.some((batch) => batch.closedAt) && (
+              <>
+                <div class="divider my-4 text-xs text-slate-400">已结束批次</div>
+                <div class="space-y-1">
+                  {project.value.emergencyBatches.filter((batch) => batch.closedAt).map((batch) => (
+                    <div key={batch.id} class="flex items-center justify-between gap-3 rounded-lg bg-slate-50 px-3 py-2 text-xs">
+                      <span class="min-w-0 flex-1 truncate">
+                        <strong>{batch.eventNo}</strong> · {batch.entries.length} 条标识 · 结束于 {new Date(batch.closedAt!).toLocaleString()}
+                      </span>
+                      <button class="btn btn-xs btn-outline" onClick$={() => reportBatchId.value = batch.id}>查看报告</button>
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
+          </div>
+          <div class="modal-backdrop" onClick$={() => batchModalOpen.value = false}></div>
+        </div>
+      )}
+
+      {reportBatch() && (
+        <div class="modal modal-open">
+          <div class="modal-box max-w-3xl">
+            <h3 class="text-lg font-bold">批次报告 · 事件 {reportBatch()!.eventNo}</h3>
+            <p class="mt-1 text-sm text-slate-600">{reportBatch()!.reason}</p>
+            <p class="mt-1 text-xs text-slate-400">
+              {new Date(reportBatch()!.createdAt).toLocaleString()} — {reportBatch()!.closedAt ? new Date(reportBatch()!.closedAt!).toLocaleString() : "进行中"} · 事件范围 {reportBatch()!.entries.length} 条标识
+            </p>
+            <div class="alert alert-warning mt-3 py-2 text-xs">批次结束不会自动恢复各标识原状态，下方最终状态即为当前有效状态。</div>
+            <div class="mt-4 max-h-[55vh] space-y-3 overflow-y-auto">
+              {reportBatch()!.entries.map((entry) => {
+                const sign = project.value.signs.find((item) => item.id === entry.signId);
+                const finalText = entry.finalTargetText ?? entry.entryTargetText;
+                const unchanged = entry.entryTargetText === finalText;
+                return (
+                  <article key={entry.signId} class="rounded-xl border border-slate-200 p-3">
+                    <div class="flex flex-wrap items-center justify-between gap-2">
+                      <span class="font-mono text-xs font-bold">{entry.code}{sign ? ` · ${sign.scenario}` : ""}</span>
+                      <span class="flex items-center gap-2 text-xs">
+                        原状态 <span class={`badge badge-sm ${statusClass(entry.originalStatus)}`}>{STATUS_LABELS[entry.originalStatus]}</span>
+                        <span class="text-slate-400">→</span>
+                        最终 <span class={`badge badge-sm ${statusClass(entry.finalStatus ?? entry.originalStatus)}`}>{STATUS_LABELS[entry.finalStatus ?? entry.originalStatus]}</span>
+                      </span>
+                    </div>
+                    {sign && <p class="mt-1 truncate text-xs text-slate-500">{sign.sourceText}</p>}
+                    {unchanged ? (
+                      <div class="mt-2 rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-500">译文未变化 · 批次快照 {entry.versionIds.length} 个</div>
+                    ) : (
+                      <>
+                        <div class="mt-2 rounded-lg bg-slate-900 p-3 text-sm leading-7 text-slate-100">
+                          {diffText(entry.entryTargetText, finalText).map((token, index) => (
+                            <span key={index} class={token.type === "add" ? "rounded bg-green-400/25 text-green-200" : token.type === "remove" ? "bg-red-400/25 text-red-200 line-through" : ""}>{token.value}</span>
+                          ))}
+                        </div>
+                        <div class="mt-1 flex gap-3 text-[11px] text-slate-500"><span class="text-green-700">绿：新增</span><span class="text-red-700">红：删除</span><span class="ml-auto">批次快照 {entry.versionIds.length} 个</span></div>
+                      </>
+                    )}
+                  </article>
+                );
+              })}
+            </div>
+            <div class="modal-action">
+              <button class="btn btn-primary btn-sm" onClick$={() => reportBatchId.value = ""}>关闭</button>
+            </div>
+          </div>
+          <div class="modal-backdrop" onClick$={() => reportBatchId.value = ""}></div>
+        </div>
+      )}
 
       {toast.value && <div class="toast toast-end z-50"><div class="alert alert-success"><span>{toast.value}</span></div></div>}
     </div>
